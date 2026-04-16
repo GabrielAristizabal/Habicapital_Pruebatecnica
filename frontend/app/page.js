@@ -17,10 +17,13 @@ export default async function HomePage() {
   return (
     <main className="container">
       <section className="card">
-        <h1>Proyecto Base</h1>
-        <p>FastAPI + Next.js</p>
+        <h1>Banco Simple</h1>
+        <p>Proyecto de prueba con FastAPI + Next.js</p>
         <p>
           Estado API: <strong>{status}</strong>
+        </p>
+        <p>
+          Usa la barra superior para crear tu cuenta o iniciar sesion.
         </p>
         <small>API URL: {API_URL}</small>
       </section>

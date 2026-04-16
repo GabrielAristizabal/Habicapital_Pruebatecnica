@@ -54,6 +54,9 @@ Endpoints de prueba:
 
 - `GET /`
 - `GET /health`
+- `POST /api/v1/accounts` (crear cuenta)
+- `POST /api/v1/auth/login` (iniciar sesion)
+- `POST /api/v1/auth/reset-password` (cambiar contrasena)
 
 ## Levantar frontend web (React + Next.js)
 
@@ -111,6 +114,12 @@ docker compose logs -f postgres
 Al primer arranque, Docker ejecuta automaticamente
 `backend/src/infrastructure/db/migrations/001_init_bank.sql`.
 Si el volumen ya existia, ese script no se vuelve a ejecutar.
+
+Si ya habias levantado la base anteriormente, ejecuta tambien:
+
+```bash
+psql -U postgres -d simple_bank -f backend/src/infrastructure/db/migrations/002_auth_and_contact_fields.sql
+```
 
 Para reinicializar desde cero:
 
