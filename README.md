@@ -38,6 +38,10 @@ El frontend debe consumir solo contratos de salida (tipo DTO), no entidades del 
 - Node.js 18+ y npm
 - Docker Desktop (opcional, recomendado para PostgreSQL)
 
+Variable recomendada para seguridad de transferencias:
+
+- `BANK_MASTER_SECRET` (solo backend; no exponer en frontend)
+
 ## Levantar backend (FastAPI)
 
 ```bash
@@ -58,6 +62,8 @@ Endpoints de prueba:
 - `POST /api/v1/accounts/top-up` (cargar saldo simulado)
 - `POST /api/v1/auth/login` (iniciar sesion)
 - `POST /api/v1/auth/reset-password` (cambiar contrasena)
+- `POST /api/v1/transfers/handshake/init` (inicio handshake de transferencia)
+- `POST /api/v1/transfers/execute` (ejecucion de transferencia)
 - `GET /api/v1/accounts/summary?document_number=...` (saldo y moneda)
 - `GET /api/v1/transactions/history?document_number=...&range_type=all|30d|15d` (historial)
 

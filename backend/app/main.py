@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import os
 import uuid
 from decimal import Decimal
@@ -60,6 +61,67 @@ def _ensure_schema_updates() -> None:
                 ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
                 """
             )
+            cursor.execute(
+                """
+                ALTER TABLE bank.accounts
+                ADD COLUMN IF NOT EXISTS security_hash VARCHAR(128);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bank.security_config (
+                    key VARCHAR(100) PRIMARY KEY,
+                    value VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bank.transfer_handshakes (
+                    id UUID PRIMARY KEY,
+                    source_account_id UUID NOT NULL REFERENCES bank.accounts(id),
+                    target_account_id UUID NOT NULL REFERENCES bank.accounts(id),
+                    amount NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+                    description VARCHAR(255) NOT NULL,
+                    nonce VARCHAR(80) NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED')),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_transfer_handshakes_status
+                ON bank.transfer_handshakes(status, created_at DESC);
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE bank.transfer_handshakes
+                ADD COLUMN IF NOT EXISTS challenge_nonce VARCHAR(80),
+                ADD COLUMN IF NOT EXISTS bank_ack_signature VARCHAR(128),
+                ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+                """
+            )
+
+            cursor.execute("SELECT id FROM bank.accounts WHERE security_hash IS NULL")
+            account_rows = cursor.fetchall()
+            for account_row in account_rows:
+                cursor.execute(
+                    "UPDATE bank.accounts SET security_hash = %s WHERE id = %s",
+                    (_generate_security_hash(), account_row[0]),
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO bank.security_config (key, value)
+                VALUES ('BANK_SECURITY_HASH', %s)
+                ON CONFLICT (key) DO NOTHING
+                """,
+                (_generate_security_hash(),),
+            )
 
 
 def _hash_password(password: str) -> str:
@@ -73,6 +135,40 @@ def _mask_account_number(account_number: str) -> str:
 
 def _generate_account_number() -> str:
     return f"1000{uuid.uuid4().int % 10_000_000:07d}"
+
+
+def _generate_security_hash() -> str:
+    return hashlib.sha256(f"{uuid.uuid4()}-{uuid.uuid4()}".encode("utf-8")).hexdigest()
+
+
+def _sign_values(values: list[str], secret: str) -> str:
+    payload = "|".join(values).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def _bank_master_secret() -> str:
+    # Nunca se expone al frontend.
+    return os.getenv("BANK_MASTER_SECRET", "dev-bank-secret-change-me")
+
+
+def _get_bank_security_hash(cursor) -> str:
+    cursor.execute(
+        "SELECT value FROM bank.security_config WHERE key = 'BANK_SECURITY_HASH' LIMIT 1"
+    )
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+
+    bank_hash = _generate_security_hash()
+    cursor.execute(
+        """
+        INSERT INTO bank.security_config (key, value)
+        VALUES ('BANK_SECURITY_HASH', %s)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        (bank_hash,),
+    )
+    return bank_hash
 
 
 class CreateAccountRequest(BaseModel):
@@ -100,6 +196,22 @@ class TopUpRequest(BaseModel):
     account_number: str = Field(min_length=8, max_length=20)
     amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
     description: str = Field(default="Recarga de saldo", max_length=255)
+
+
+class TransferHandshakeInitRequest(BaseModel):
+    document_number: str = Field(min_length=5, max_length=30)
+    target_account_number: str = Field(min_length=8, max_length=20)
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    description: str = Field(min_length=3, max_length=255)
+    nonce: str = Field(min_length=6, max_length=80)
+    client_signature: str = Field(min_length=20, max_length=128)
+
+
+class TransferExecuteRequest(BaseModel):
+    handshake_id: str = Field(min_length=36, max_length=36)
+    document_number: str = Field(min_length=5, max_length=30)
+    challenge_nonce: str = Field(min_length=6, max_length=80)
+    client_final_signature: str = Field(min_length=20, max_length=128)
 
 
 @app.on_event("startup")
@@ -149,8 +261,8 @@ def create_account(payload: CreateAccountRequest) -> dict:
             cursor.execute(
                 """
                 INSERT INTO bank.accounts (
-                    id, customer_id, account_number, account_type, currency_code, available_balance
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    id, customer_id, account_number, account_type, currency_code, available_balance, security_hash
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     account_id,
@@ -159,6 +271,7 @@ def create_account(payload: CreateAccountRequest) -> dict:
                     payload.account_type,
                     payload.currency_code.upper(),
                     payload.initial_balance,
+                    _generate_security_hash(),
                 ),
             )
 
@@ -338,6 +451,292 @@ def top_up_account(payload: TopUpRequest) -> dict:
         "accountNumber": account_number,
         "currencyCode": currency_code,
         "availableBalance": str(available_balance),
+    }
+
+
+@app.post("/api/v1/transfers/handshake/init")
+def transfer_handshake_init(payload: TransferHandshakeInitRequest) -> dict:
+    with psycopg2.connect(_database_url()) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT a.id, a.account_number, c.password_hash
+                FROM bank.customers c
+                JOIN bank.accounts a ON a.customer_id = c.id
+                WHERE c.document_number = %s
+                LIMIT 1
+                """,
+                (payload.document_number,),
+            )
+            source = cursor.fetchone()
+            if not source:
+                raise HTTPException(status_code=404, detail="Cuenta origen no encontrada.")
+
+            source_account_id, source_account_number, source_password_hash = source
+
+            cursor.execute(
+                "SELECT id FROM bank.accounts WHERE account_number = %s LIMIT 1",
+                (payload.target_account_number,),
+            )
+            target = cursor.fetchone()
+            if not target:
+                raise HTTPException(status_code=404, detail="Cuenta destino no encontrada.")
+            target_account_id = target[0]
+
+            if payload.target_account_number == source_account_number:
+                raise HTTPException(
+                    status_code=400, detail="No puedes transferir a la misma cuenta."
+                )
+
+            expected_client_signature = _sign_values(
+                [
+                    payload.document_number,
+                    payload.target_account_number,
+                    str(payload.amount),
+                    payload.description,
+                    payload.nonce,
+                ],
+                source_password_hash,
+            )
+            if payload.client_signature != expected_client_signature:
+                raise HTTPException(status_code=401, detail="Firma de cliente invalida.")
+
+            handshake_id = str(uuid.uuid4())
+            challenge_nonce = str(uuid.uuid4())
+            bank_ack_signature = _sign_values(
+                [handshake_id, challenge_nonce, payload.nonce, "ACK"],
+                _bank_master_secret(),
+            )
+            cursor.execute(
+                """
+                INSERT INTO bank.transfer_handshakes (
+                    id, source_account_id, target_account_id, amount, description, nonce, challenge_nonce, bank_ack_signature, expires_at, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW() + INTERVAL '5 minutes', 'PENDING')
+                """,
+                (
+                    handshake_id,
+                    source_account_id,
+                    target_account_id,
+                    payload.amount,
+                    payload.description,
+                    payload.nonce,
+                    challenge_nonce,
+                    bank_ack_signature,
+                ),
+            )
+
+    return {
+        "handshakeId": handshake_id,
+        "challengeNonce": challenge_nonce,
+        "bankAckSignature": bank_ack_signature,
+        "message": "Handshake completado.",
+    }
+
+
+@app.post("/api/v1/transfers/execute")
+def transfer_execute(payload: TransferExecuteRequest) -> dict:
+    with psycopg2.connect(_database_url()) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    h.id,
+                    h.source_account_id,
+                    h.target_account_id,
+                    h.amount,
+                    h.description,
+                    h.status,
+                    h.nonce,
+                    h.challenge_nonce,
+                    h.bank_ack_signature,
+                    h.expires_at,
+                    src.account_number,
+                    src.available_balance,
+                    src.currency_code,
+                    c.password_hash,
+                    tgt.account_number
+                FROM bank.transfer_handshakes h
+                JOIN bank.accounts src ON src.id = h.source_account_id
+                JOIN bank.accounts tgt ON tgt.id = h.target_account_id
+                JOIN bank.customers c ON c.id = src.customer_id
+                WHERE h.id = %s AND c.document_number = %s
+                LIMIT 1
+                """,
+                (payload.handshake_id, payload.document_number),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Handshake no encontrado.")
+
+            (
+                handshake_id,
+                source_account_id,
+                target_account_id,
+                amount,
+                description,
+                status,
+                client_nonce,
+                stored_challenge_nonce,
+                stored_bank_ack_signature,
+                expires_at,
+                source_account_number,
+                source_available_balance,
+                source_currency,
+                source_password_hash,
+                target_account_number,
+            ) = row
+
+            if status != "PENDING":
+                raise HTTPException(status_code=409, detail="Handshake ya procesado.")
+
+            if stored_challenge_nonce != payload.challenge_nonce:
+                cursor.execute(
+                    "UPDATE bank.transfer_handshakes SET status = 'FAILED' WHERE id = %s",
+                    (handshake_id,),
+                )
+                raise HTTPException(status_code=401, detail="Challenge invalido.")
+
+            cursor.execute("SELECT NOW()")
+            now_value = cursor.fetchone()[0]
+            if not expires_at or expires_at <= now_value:
+                cursor.execute(
+                    "UPDATE bank.transfer_handshakes SET status = 'FAILED' WHERE id = %s",
+                    (handshake_id,),
+                )
+                raise HTTPException(status_code=401, detail="Handshake expirado.")
+
+            expected_bank_ack = _sign_values(
+                [handshake_id, stored_challenge_nonce, client_nonce, "ACK"],
+                _bank_master_secret(),
+            )
+            if stored_bank_ack_signature != expected_bank_ack:
+                cursor.execute(
+                    "UPDATE bank.transfer_handshakes SET status = 'FAILED' WHERE id = %s",
+                    (handshake_id,),
+                )
+                raise HTTPException(status_code=401, detail="ACK del banco invalido.")
+
+            expected_final_signature = _sign_values(
+                [handshake_id, stored_challenge_nonce, "EXECUTE"],
+                source_password_hash,
+            )
+            if payload.client_final_signature != expected_final_signature:
+                cursor.execute(
+                    "UPDATE bank.transfer_handshakes SET status = 'FAILED' WHERE id = %s",
+                    (handshake_id,),
+                )
+                raise HTTPException(status_code=401, detail="Firma final invalida.")
+
+            if source_available_balance < amount:
+                cursor.execute(
+                    "UPDATE bank.transfer_handshakes SET status = 'FAILED' WHERE id = %s",
+                    (handshake_id,),
+                )
+                raise HTTPException(status_code=400, detail="Saldo insuficiente.")
+
+            # Primero acreditamos cuenta destino y confirmamos el nuevo saldo.
+            cursor.execute(
+                """
+                UPDATE bank.accounts
+                SET available_balance = available_balance + %s, updated_at = NOW()
+                WHERE id = %s
+                RETURNING available_balance
+                """,
+                (amount, target_account_id),
+            )
+            target_balance_after = cursor.fetchone()
+            if not target_balance_after:
+                cursor.execute(
+                    "UPDATE bank.transfer_handshakes SET status = 'FAILED' WHERE id = %s",
+                    (handshake_id,),
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="No fue posible acreditar la cuenta destino.",
+                )
+
+            # Solo despues de confirmar el credito, debitamos origen.
+            cursor.execute(
+                """
+                UPDATE bank.accounts
+                SET available_balance = available_balance - %s, updated_at = NOW()
+                WHERE id = %s AND available_balance >= %s
+                RETURNING available_balance
+                """,
+                (amount, source_account_id, amount),
+            )
+            source_balance_after = cursor.fetchone()
+            if not source_balance_after:
+                cursor.execute(
+                    "UPDATE bank.transfer_handshakes SET status = 'FAILED' WHERE id = %s",
+                    (handshake_id,),
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail="Saldo insuficiente al confirmar la transferencia.",
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO bank.transactions (
+                    id, account_id, transaction_type, amount, description, reference_code
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    source_account_id,
+                    "TRANSFER_OUT",
+                    amount,
+                    description,
+                    target_account_number,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO bank.transactions (
+                    id, account_id, transaction_type, amount, description, reference_code
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    target_account_id,
+                    "TRANSFER_IN",
+                    amount,
+                    description,
+                    source_account_number,
+                ),
+            )
+
+            cursor.execute(
+                """
+                UPDATE bank.transfer_handshakes
+                SET status = 'COMPLETED', completed_at = NOW()
+                WHERE id = %s
+                """,
+                (handshake_id,),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO bank.audit_logs (id, actor_id, action, entity_name, entity_id, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    source_account_id,
+                    "TRANSFER_EXECUTED",
+                    "transfer_handshakes",
+                    handshake_id,
+                    '{"origin":"api"}',
+                ),
+            )
+
+            new_balance = source_balance_after[0]
+
+    return {
+        "message": "Transferencia realizada correctamente.",
+        "currencyCode": source_currency,
+        "availableBalance": str(new_balance),
     }
 
 

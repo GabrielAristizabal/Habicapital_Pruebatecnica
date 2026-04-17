@@ -15,6 +15,11 @@ export default function DashboardPage() {
   const [history, setHistory] = useState([]);
   const [rangeType, setRangeType] = useState("all");
   const [showFullAccountNumber, setShowFullAccountNumber] = useState(false);
+  const [targetAccount, setTargetAccount] = useState("");
+  const [transferAmount, setTransferAmount] = useState("");
+  const [transferDescription, setTransferDescription] = useState("");
+  const [transferPassword, setTransferPassword] = useState("");
+  const [transferMessage, setTransferMessage] = useState("");
   const [message, setMessage] = useState("");
 
   const documentNumber =
@@ -67,6 +72,14 @@ export default function DashboardPage() {
     loadHistory();
   }, [documentNumber, rangeType]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const userName = localStorage.getItem("user_name");
+    if (!transferDescription && userName) {
+      setTransferDescription(`Transferencia de ${userName}`);
+    }
+  }, [transferDescription]);
+
   const balanceLabel = useMemo(() => {
     if (!account) return "-";
     return `${account.currencyCode} ${account.availableBalance}`;
@@ -83,6 +96,115 @@ export default function DashboardPage() {
     }
     return account.maskedAccountNumber;
   }, [account, showFullAccountNumber]);
+
+  const refreshDashboardData = async () => {
+    if (!documentNumber) return;
+    const [summaryResponse, historyResponse] = await Promise.all([
+      fetch(`${API_URL}/api/v1/accounts/summary?document_number=${documentNumber}`),
+      fetch(
+        `${API_URL}/api/v1/transactions/history?document_number=${documentNumber}&range_type=${rangeType}`
+      ),
+    ]);
+    const summaryData = await summaryResponse.json();
+    const historyData = await historyResponse.json();
+    if (summaryResponse.ok) setAccount(summaryData);
+    if (historyResponse.ok) setHistory(historyData.items || []);
+  };
+
+  const hashText = async (text) => {
+    const data = new TextEncoder().encode(text);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  };
+
+  const signPayload = async (values, secret) => {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    const signatureBuffer = await crypto.subtle.sign(
+      "HMAC",
+      key,
+      new TextEncoder().encode(values.join("|"))
+    );
+    return Array.from(new Uint8Array(signatureBuffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  };
+
+  const onTransferSubmit = async (event) => {
+    event.preventDefault();
+    if (!documentNumber) {
+      setTransferMessage("No hay sesion activa.");
+      return;
+    }
+    if (!targetAccount || !transferAmount || !transferPassword) {
+      setTransferMessage("Completa cuenta, monto y contrasena.");
+      return;
+    }
+
+    try {
+      setTransferMessage("Iniciando handshake de seguridad...");
+      const nonce = `${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+      const amountString = Number(transferAmount).toString();
+      const passwordDigest = await hashText(transferPassword);
+      const initSignature = await signPayload(
+        [documentNumber, targetAccount, amountString, transferDescription, nonce],
+        passwordDigest
+      );
+
+      const initResponse = await fetch(`${API_URL}/api/v1/transfers/handshake/init`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          document_number: documentNumber,
+          target_account_number: targetAccount,
+          amount: Number(transferAmount),
+          description: transferDescription,
+          nonce,
+          client_signature: initSignature,
+        }),
+      });
+      const initData = await initResponse.json();
+      if (!initResponse.ok) {
+        setTransferMessage(initData.detail || "No fue posible iniciar la transferencia.");
+        return;
+      }
+
+      const finalSignature = await signPayload(
+        [initData.handshakeId, initData.challengeNonce, "EXECUTE"],
+        passwordDigest
+      );
+      const executeResponse = await fetch(`${API_URL}/api/v1/transfers/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          handshake_id: initData.handshakeId,
+          document_number: documentNumber,
+          challenge_nonce: initData.challengeNonce,
+          client_final_signature: finalSignature,
+        }),
+      });
+      const executeData = await executeResponse.json();
+      if (!executeResponse.ok) {
+        setTransferMessage(executeData.detail || "No fue posible ejecutar la transferencia.");
+        return;
+      }
+
+      setTransferMessage("Transferencia realizada correctamente.");
+      setTransferAmount("");
+      setTargetAccount("");
+      setTransferPassword("");
+      await refreshDashboardData();
+    } catch (error) {
+      setTransferMessage("Error de conexion durante la transferencia.");
+    }
+  };
 
   return (
     <main className="dashboard-container">
@@ -105,7 +227,40 @@ export default function DashboardPage() {
 
         <article className="panel panel-transfer">
           <h2>Transferir</h2>
-          <p className="muted">Seccion en construccion.</p>
+          <form className="form-grid" onSubmit={onTransferSubmit}>
+            <input
+              value={targetAccount}
+              onChange={(event) => setTargetAccount(event.target.value)}
+              placeholder="Cuenta objetivo"
+              required
+            />
+            <input
+              type="number"
+              min="0.01"
+              step="0.01"
+              value={transferAmount}
+              onChange={(event) => setTransferAmount(event.target.value)}
+              placeholder="Monto a transferir"
+              required
+            />
+            <input
+              value={transferDescription}
+              onChange={(event) => setTransferDescription(event.target.value)}
+              placeholder="Descripcion"
+              required
+            />
+            <input
+              type="password"
+              value={transferPassword}
+              onChange={(event) => setTransferPassword(event.target.value)}
+              placeholder="Contrasena de confirmacion"
+              required
+            />
+            <button type="submit" className="btn btn-primary">
+              Transferir
+            </button>
+          </form>
+          {transferMessage ? <p className="feedback">{transferMessage}</p> : null}
         </article>
 
         <article className="panel panel-history">
