@@ -31,6 +31,11 @@ export default function LoginPage() {
       }
       localStorage.setItem("access_token", data.accessToken);
       localStorage.setItem("user_name", data.user.fullName);
+      localStorage.setItem("document_number", documentNumber);
+      if (data.user.fullAccountNumber) {
+        localStorage.setItem("full_account_number", data.user.fullAccountNumber);
+      }
+      window.dispatchEvent(new Event("session-changed"));
       router.push("/dashboard");
     } catch (error) {
       setMessage("Error de conexion con el backend.");

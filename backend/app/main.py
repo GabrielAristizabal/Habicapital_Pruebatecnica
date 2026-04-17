@@ -2,6 +2,7 @@ import hashlib
 import os
 import uuid
 from decimal import Decimal
+from typing import Literal
 
 import psycopg2
 from fastapi import FastAPI, HTTPException
@@ -95,6 +96,12 @@ class ResetPasswordRequest(BaseModel):
     new_password: str = Field(min_length=6, max_length=100)
 
 
+class TopUpRequest(BaseModel):
+    account_number: str = Field(min_length=8, max_length=20)
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    description: str = Field(default="Recarga de saldo", max_length=255)
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     _ensure_schema_updates()
@@ -155,6 +162,23 @@ def create_account(payload: CreateAccountRequest) -> dict:
                 ),
             )
 
+            if payload.initial_balance > 0:
+                cursor.execute(
+                    """
+                    INSERT INTO bank.transactions (
+                        id, account_id, transaction_type, amount, description, reference_code
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        account_id,
+                        "DEPOSIT",
+                        payload.initial_balance,
+                        "Deposito inicial de apertura",
+                        "APERTURA",
+                    ),
+                )
+
             cursor.execute(
                 """
                 INSERT INTO bank.audit_logs (id, actor_id, action, entity_name, entity_id, metadata)
@@ -212,6 +236,7 @@ def login(payload: LoginRequest) -> dict:
         "user": {
             "customerId": str(customer_id),
             "fullName": full_name,
+            "fullAccountNumber": account_number,
             "accountNumber": _mask_account_number(account_number),
         },
     }
@@ -253,3 +278,141 @@ def reset_password(payload: ResetPasswordRequest) -> dict[str, str]:
             )
 
     return {"message": "Contrasena actualizada correctamente."}
+
+
+@app.post("/api/v1/accounts/top-up")
+def top_up_account(payload: TopUpRequest) -> dict:
+    with psycopg2.connect(_database_url()) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE bank.accounts
+                SET
+                    available_balance = available_balance + %s,
+                    updated_at = NOW()
+                WHERE account_number = %s
+                RETURNING id, customer_id, account_number, currency_code, available_balance
+                """,
+                (payload.amount, payload.account_number),
+            )
+            account_row = cursor.fetchone()
+
+            if not account_row:
+                raise HTTPException(status_code=404, detail="Numero de cuenta no encontrado.")
+
+            account_id, customer_id, account_number, currency_code, available_balance = account_row
+
+            cursor.execute(
+                """
+                INSERT INTO bank.transactions (
+                    id, account_id, transaction_type, amount, description, reference_code
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    account_id,
+                    "DEPOSIT",
+                    payload.amount,
+                    payload.description,
+                    account_number,
+                ),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO bank.audit_logs (id, actor_id, action, entity_name, entity_id, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    customer_id,
+                    "TOP_UP",
+                    "accounts",
+                    account_id,
+                    '{"origin":"api"}',
+                ),
+            )
+
+    return {
+        "message": "Saldo cargado correctamente.",
+        "accountNumber": account_number,
+        "currencyCode": currency_code,
+        "availableBalance": str(available_balance),
+    }
+
+
+@app.get("/api/v1/accounts/summary")
+def account_summary(document_number: str) -> dict:
+    with psycopg2.connect(_database_url()) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    c.full_name,
+                    a.account_number,
+                    a.currency_code,
+                    a.available_balance
+                FROM bank.customers c
+                JOIN bank.accounts a ON a.customer_id = c.id
+                WHERE c.document_number = %s
+                LIMIT 1
+                """,
+                (document_number,),
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Cuenta no encontrada.")
+
+    full_name, account_number, currency_code, available_balance = row
+    return {
+        "fullName": full_name,
+        "accountNumber": account_number,
+        "maskedAccountNumber": _mask_account_number(account_number),
+        "currencyCode": currency_code,
+        "availableBalance": str(available_balance),
+    }
+
+
+@app.get("/api/v1/transactions/history")
+def transaction_history(
+    document_number: str,
+    range_type: Literal["all", "30d", "15d"] = "all",
+) -> dict:
+    filters = ""
+    params: list = [document_number]
+    if range_type == "30d":
+        filters = "AND t.created_at >= NOW() - INTERVAL '30 days'"
+    elif range_type == "15d":
+        filters = "AND t.created_at >= NOW() - INTERVAL '15 days'"
+
+    with psycopg2.connect(_database_url()) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    t.created_at,
+                    COALESCE(t.reference_code, 'N/A') AS target_account,
+                    t.amount,
+                    COALESCE(t.description, 'Sin descripcion') AS description
+                FROM bank.transactions t
+                JOIN bank.accounts a ON a.id = t.account_id
+                JOIN bank.customers c ON c.id = a.customer_id
+                WHERE c.document_number = %s
+                {filters}
+                ORDER BY t.created_at DESC
+                """,
+                params,
+            )
+            rows = cursor.fetchall()
+
+    items = [
+        {
+            "date": row[0].isoformat(),
+            "targetAccount": row[1],
+            "amount": str(row[2]),
+            "description": row[3],
+        }
+        for row in rows
+    ]
+    return {"items": items}

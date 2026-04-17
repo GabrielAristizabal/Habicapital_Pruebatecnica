@@ -55,8 +55,11 @@ Endpoints de prueba:
 - `GET /`
 - `GET /health`
 - `POST /api/v1/accounts` (crear cuenta)
+- `POST /api/v1/accounts/top-up` (cargar saldo simulado)
 - `POST /api/v1/auth/login` (iniciar sesion)
 - `POST /api/v1/auth/reset-password` (cambiar contrasena)
+- `GET /api/v1/accounts/summary?document_number=...` (saldo y moneda)
+- `GET /api/v1/transactions/history?document_number=...&range_type=all|30d|15d` (historial)
 
 ## Levantar frontend web (React + Next.js)
 
