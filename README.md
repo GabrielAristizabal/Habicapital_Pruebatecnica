@@ -19,7 +19,7 @@ docs/
   contracts/
 ```
 
-## Estructura backend propuesta (sin logica aun)
+## Estructura backend
 
 ```txt
 backend/src/
@@ -30,17 +30,18 @@ backend/src/
   shared/                # seguridad y configuracion
 ```
 
-El frontend debe consumir solo contratos de salida (tipo DTO), no entidades del dominio.
-
 ## Requisitos
 
 - Python 3.10+ (recomendado)
 - Node.js 18+ y npm
 - Docker Desktop (opcional, recomendado para PostgreSQL)
 
-Variable recomendada para seguridad de transferencias:
+Variables recomendadas para el backend:
 
 - `BANK_MASTER_SECRET` (solo backend; no exponer en frontend)
+- `USD_COP_RATE` (opcional; por defecto `4000` COP por 1 USD en transferencias entre monedas)
+
+Solo se admiten monedas de cuenta `COP` y `USD`. En transferencias cruzadas se convierte el monto acreditado al destino usando esa tasa.
 
 ## Levantar backend (FastAPI)
 
@@ -65,7 +66,7 @@ Endpoints de prueba:
 - `POST /api/v1/transfers/handshake/init` (inicio handshake de transferencia)
 - `POST /api/v1/transfers/execute` (ejecucion de transferencia)
 - `GET /api/v1/accounts/summary?document_number=...` (saldo y moneda)
-- `GET /api/v1/transactions/history?document_number=...&range_type=all|30d|15d` (historial)
+- `GET /api/v1/transactions/history?document_number=...&range_type=all|ytd|30d|15d` (historial; opcional `page` y `page_size`; `ytd` = desde el 1 de enero del año actual)
 
 ## Levantar frontend web (React + Next.js)
 
@@ -120,11 +121,7 @@ docker compose ps
 docker compose logs -f postgres
 ```
 
-Al primer arranque, Docker ejecuta automaticamente
-`backend/src/infrastructure/db/migrations/001_init_bank.sql`.
-Si el volumen ya existia, ese script no se vuelve a ejecutar.
-
-Si ya habias levantado la base anteriormente, ejecuta tambien:
+Al levantar la base por primera vez, ejecutar tambien:
 
 ```bash
 psql -U postgres -d simple_bank -f backend/src/infrastructure/db/migrations/002_auth_and_contact_fields.sql

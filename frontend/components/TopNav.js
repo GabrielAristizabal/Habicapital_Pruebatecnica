@@ -37,18 +37,26 @@ export default function TopNav() {
     <header className="topbar">
       <div className="topbar-inner">
         {isLoggedIn ? (
-          <span className="brand brand-static">Banco Simple</span>
+          <span className="brand brand-static">RetoHabiCapital</span>
         ) : (
           <Link href="/" className="brand">
-            Banco Simple
+            RetoHabiCapital
           </Link>
         )}
 
         <nav className="topbar-actions">
           {isLoggedIn ? (
-            <button type="button" className="btn btn-secondary" onClick={handleLogout}>
-              Cerrar sesion
-            </button>
+            <>
+              <Link href="/dashboard" className="btn btn-secondary">
+                Panel
+              </Link>
+              <Link href="/insights" className="btn btn-secondary">
+                Resumen graficos
+              </Link>
+              <button type="button" className="btn btn-secondary" onClick={handleLogout}>
+                Cerrar sesion
+              </button>
+            </>
           ) : (
             <>
               <Link href="/create-account" className="btn btn-secondary">

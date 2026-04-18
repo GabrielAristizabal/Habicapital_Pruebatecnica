@@ -2,13 +2,13 @@ import hashlib
 import hmac
 import os
 import uuid
-from decimal import Decimal
-from typing import Literal
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Literal, Optional
 
 import psycopg2
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 app = FastAPI(
@@ -106,6 +106,14 @@ def _ensure_schema_updates() -> None:
                 """
             )
 
+            cursor.execute(
+                """
+                UPDATE bank.accounts
+                SET currency_code = 'USD'
+                WHERE currency_code IS NULL OR currency_code NOT IN ('COP', 'USD');
+                """
+            )
+
             cursor.execute("SELECT id FROM bank.accounts WHERE security_hash IS NULL")
             account_rows = cursor.fetchall()
             for account_row in account_rows:
@@ -151,6 +159,55 @@ def _bank_master_secret() -> str:
     return os.getenv("BANK_MASTER_SECRET", "dev-bank-secret-change-me")
 
 
+def _usd_cop_rate() -> Decimal:
+    raw = os.getenv("USD_COP_RATE", "4000").strip()
+    try:
+        rate = Decimal(raw)
+    except Exception:
+        rate = Decimal("4000")
+    if rate <= 0:
+        return Decimal("4000")
+    return rate
+
+
+def _allowed_currency_codes() -> tuple[str, str]:
+    return ("COP", "USD")
+
+
+def _normalize_currency(code: str) -> str:
+    return (code or "").strip().upper()
+
+
+def _require_cop_usd(currency_code: str, field_name: str = "moneda") -> str:
+    normalized = _normalize_currency(currency_code)
+    if normalized not in _allowed_currency_codes():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Solo se permiten COP y USD en {field_name}. Valor recibido: {currency_code!r}.",
+        )
+    return normalized
+
+
+def _credit_amount_after_fx(
+    amount_debit_source: Decimal, source_curr: str, target_curr: str
+) -> Decimal:
+    s = _normalize_currency(source_curr)
+    t = _normalize_currency(target_curr)
+    _require_cop_usd(s, "cuenta origen")
+    _require_cop_usd(t, "cuenta destino")
+    if s == t:
+        return amount_debit_source
+    rate = _usd_cop_rate()
+    if s == "USD" and t == "COP":
+        return (amount_debit_source * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if s == "COP" and t == "USD":
+        return (amount_debit_source / rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    raise HTTPException(
+        status_code=400,
+        detail="Combinacion de monedas no soportada.",
+    )
+
+
 def _get_bank_security_hash(cursor) -> str:
     cursor.execute(
         "SELECT value FROM bank.security_config WHERE key = 'BANK_SECURITY_HASH' LIMIT 1"
@@ -179,7 +236,14 @@ class CreateAccountRequest(BaseModel):
     password: str = Field(min_length=6, max_length=100)
     initial_balance: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
     account_type: str = Field(default="SAVINGS", pattern="^(SAVINGS|CHECKING)$")
-    currency_code: str = Field(default="USD", min_length=3, max_length=3)
+    currency_code: str = Field(default="USD", pattern="^(COP|USD)$")
+
+    @field_validator("currency_code", mode="before")
+    @classmethod
+    def normalize_currency_code(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().upper()
+        return value
 
 
 class LoginRequest(BaseModel):
@@ -460,7 +524,7 @@ def transfer_handshake_init(payload: TransferHandshakeInitRequest) -> dict:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT a.id, a.account_number, c.password_hash
+                SELECT a.id, a.account_number, c.password_hash, a.currency_code
                 FROM bank.customers c
                 JOIN bank.accounts a ON a.customer_id = c.id
                 WHERE c.document_number = %s
@@ -472,16 +536,20 @@ def transfer_handshake_init(payload: TransferHandshakeInitRequest) -> dict:
             if not source:
                 raise HTTPException(status_code=404, detail="Cuenta origen no encontrada.")
 
-            source_account_id, source_account_number, source_password_hash = source
+            source_account_id, source_account_number, source_password_hash, source_currency = (
+                source
+            )
+            source_currency = _require_cop_usd(source_currency, "cuenta origen")
 
             cursor.execute(
-                "SELECT id FROM bank.accounts WHERE account_number = %s LIMIT 1",
+                "SELECT id, currency_code FROM bank.accounts WHERE account_number = %s LIMIT 1",
                 (payload.target_account_number,),
             )
             target = cursor.fetchone()
             if not target:
                 raise HTTPException(status_code=404, detail="Cuenta destino no encontrada.")
-            target_account_id = target[0]
+            target_account_id, target_currency = target
+            target_currency = _require_cop_usd(target_currency, "cuenta destino")
 
             if payload.target_account_number == source_account_number:
                 raise HTTPException(
@@ -525,11 +593,20 @@ def transfer_handshake_init(payload: TransferHandshakeInitRequest) -> dict:
                 ),
             )
 
+            credit_preview = _credit_amount_after_fx(
+                payload.amount, source_currency, target_currency
+            )
+
     return {
         "handshakeId": handshake_id,
         "challengeNonce": challenge_nonce,
         "bankAckSignature": bank_ack_signature,
         "message": "Handshake completado.",
+        "sourceCurrency": source_currency,
+        "targetCurrency": target_currency,
+        "amountDebitedInSourceCurrency": str(payload.amount),
+        "amountCreditedInTargetCurrency": str(credit_preview),
+        "fxRateUsdCop": str(_usd_cop_rate()),
     }
 
 
@@ -554,7 +631,8 @@ def transfer_execute(payload: TransferExecuteRequest) -> dict:
                     src.available_balance,
                     src.currency_code,
                     c.password_hash,
-                    tgt.account_number
+                    tgt.account_number,
+                    tgt.currency_code
                 FROM bank.transfer_handshakes h
                 JOIN bank.accounts src ON src.id = h.source_account_id
                 JOIN bank.accounts tgt ON tgt.id = h.target_account_id
@@ -584,10 +662,24 @@ def transfer_execute(payload: TransferExecuteRequest) -> dict:
                 source_currency,
                 source_password_hash,
                 target_account_number,
+                target_currency,
             ) = row
 
             if status != "PENDING":
                 raise HTTPException(status_code=409, detail="Handshake ya procesado.")
+
+            source_currency = _require_cop_usd(source_currency, "cuenta origen")
+            target_currency = _require_cop_usd(target_currency, "cuenta destino")
+            credit_amount = _credit_amount_after_fx(amount, source_currency, target_currency)
+            if credit_amount <= 0:
+                cursor.execute(
+                    "UPDATE bank.transfer_handshakes SET status = 'FAILED' WHERE id = %s",
+                    (handshake_id,),
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail="Monto acreditado en destino invalido tras conversion.",
+                )
 
             if stored_challenge_nonce != payload.challenge_nonce:
                 cursor.execute(
@@ -634,6 +726,15 @@ def transfer_execute(payload: TransferExecuteRequest) -> dict:
                 )
                 raise HTTPException(status_code=400, detail="Saldo insuficiente.")
 
+            fx_note = ""
+            if source_currency != target_currency:
+                fx_note = (
+                    f" (TC 1 USD = {_usd_cop_rate()} COP; "
+                    f"-{amount} {source_currency} / +{credit_amount} {target_currency})"
+                )
+            description_out = f"{description}{fx_note}"
+            description_in = description_out
+
             # Primero acreditamos cuenta destino y confirmamos el nuevo saldo.
             cursor.execute(
                 """
@@ -642,7 +743,7 @@ def transfer_execute(payload: TransferExecuteRequest) -> dict:
                 WHERE id = %s
                 RETURNING available_balance
                 """,
-                (amount, target_account_id),
+                (credit_amount, target_account_id),
             )
             target_balance_after = cursor.fetchone()
             if not target_balance_after:
@@ -687,7 +788,7 @@ def transfer_execute(payload: TransferExecuteRequest) -> dict:
                     source_account_id,
                     "TRANSFER_OUT",
                     amount,
-                    description,
+                    description_out,
                     target_account_number,
                 ),
             )
@@ -701,8 +802,8 @@ def transfer_execute(payload: TransferExecuteRequest) -> dict:
                     str(uuid.uuid4()),
                     target_account_id,
                     "TRANSFER_IN",
-                    amount,
-                    description,
+                    credit_amount,
+                    description_in,
                     source_account_number,
                 ),
             )
@@ -776,7 +877,9 @@ def account_summary(document_number: str) -> dict:
 @app.get("/api/v1/transactions/history")
 def transaction_history(
     document_number: str,
-    range_type: Literal["all", "30d", "15d"] = "all",
+    range_type: Literal["all", "30d", "15d", "ytd"] = "all",
+    page: Optional[int] = Query(default=None, ge=1),
+    page_size: int = Query(default=10, ge=1, le=50),
 ) -> dict:
     filters = ""
     params: list = [document_number]
@@ -784,26 +887,60 @@ def transaction_history(
         filters = "AND t.created_at >= NOW() - INTERVAL '30 days'"
     elif range_type == "15d":
         filters = "AND t.created_at >= NOW() - INTERVAL '15 days'"
+    elif range_type == "ytd":
+        filters = "AND t.created_at >= date_trunc('year', CURRENT_TIMESTAMP)"
 
-    with psycopg2.connect(_database_url()) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                f"""
-                SELECT
-                    t.created_at,
-                    COALESCE(t.reference_code, 'N/A') AS target_account,
-                    t.amount,
-                    COALESCE(t.description, 'Sin descripcion') AS description
+    base_from = """
                 FROM bank.transactions t
                 JOIN bank.accounts a ON a.id = t.account_id
                 JOIN bank.customers c ON c.id = a.customer_id
                 WHERE c.document_number = %s
-                {filters}
-                ORDER BY t.created_at DESC
-                """,
-                params,
-            )
-            rows = cursor.fetchall()
+                """
+
+    select_fields = """
+                SELECT
+                    t.created_at,
+                    COALESCE(t.reference_code, 'N/A') AS target_account,
+                    t.amount,
+                    COALESCE(t.description, 'Sin descripcion') AS description,
+                    t.transaction_type
+                """
+
+    with psycopg2.connect(_database_url()) as conn:
+        with conn.cursor() as cursor:
+            if page is None:
+                cursor.execute(
+                    f"""
+                    {select_fields}
+                    {base_from}
+                    {filters}
+                    ORDER BY t.created_at DESC
+                    """,
+                    params,
+                )
+                rows = cursor.fetchall()
+            else:
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    {base_from}
+                    {filters}
+                    """,
+                    params,
+                )
+                total = int(cursor.fetchone()[0])
+                offset = (page - 1) * page_size
+                cursor.execute(
+                    f"""
+                    {select_fields}
+                    {base_from}
+                    {filters}
+                    ORDER BY t.created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (*params, page_size, offset),
+                )
+                rows = cursor.fetchall()
 
     items = [
         {
@@ -811,7 +948,17 @@ def transaction_history(
             "targetAccount": row[1],
             "amount": str(row[2]),
             "description": row[3],
+            "transactionType": row[4],
         }
         for row in rows
     ]
-    return {"items": items}
+    if page is None:
+        return {"items": items}
+    total_pages = max(1, (total + page_size - 1) // page_size) if total > 0 else 1
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }

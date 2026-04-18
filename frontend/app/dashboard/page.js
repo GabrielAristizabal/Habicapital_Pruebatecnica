@@ -1,18 +1,27 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
+import { categoryBadgeForItem, flowForTransactionType } from "../../lib/transactionInsights";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 
 const FILTER_OPTIONS = [
   { value: "all", label: "Todos los tiempos" },
+  { value: "ytd", label: "Este año" },
   { value: "30d", label: "Ultimos 30 dias" },
   { value: "15d", label: "Ultimos 15 dias" },
 ];
 
+const PAGE_SIZE = 5;
+
 export default function DashboardPage() {
   const [account, setAccount] = useState(null);
   const [history, setHistory] = useState([]);
+  const [historyPage, setHistoryPage] = useState(1);
+  /** null = aun no cargado */
+  const [historyTotal, setHistoryTotal] = useState(null);
+  const [historyTotalPages, setHistoryTotalPages] = useState(1);
   const [rangeType, setRangeType] = useState("all");
   const [showFullAccountNumber, setShowFullAccountNumber] = useState(false);
   const [targetAccount, setTargetAccount] = useState("");
@@ -56,7 +65,7 @@ export default function DashboardPage() {
     const loadHistory = async () => {
       try {
         const response = await fetch(
-          `${API_URL}/api/v1/transactions/history?document_number=${documentNumber}&range_type=${rangeType}`
+          `${API_URL}/api/v1/transactions/history?document_number=${documentNumber}&range_type=${rangeType}&page=${historyPage}&page_size=${PAGE_SIZE}`
         );
         const data = await response.json();
         if (!response.ok) {
@@ -64,13 +73,17 @@ export default function DashboardPage() {
           return;
         }
         setHistory(data.items || []);
+        setHistoryTotal(typeof data.total === "number" ? data.total : 0);
+        setHistoryTotalPages(typeof data.total_pages === "number" ? data.total_pages : 1);
       } catch (error) {
         setMessage("No se pudo cargar el historial.");
+        setHistoryTotal(0);
+        setHistory([]);
       }
     };
 
     loadHistory();
-  }, [documentNumber, rangeType]);
+  }, [documentNumber, rangeType, historyPage]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -102,13 +115,20 @@ export default function DashboardPage() {
     const [summaryResponse, historyResponse] = await Promise.all([
       fetch(`${API_URL}/api/v1/accounts/summary?document_number=${documentNumber}`),
       fetch(
-        `${API_URL}/api/v1/transactions/history?document_number=${documentNumber}&range_type=${rangeType}`
+        `${API_URL}/api/v1/transactions/history?document_number=${documentNumber}&range_type=${rangeType}&page=1&page_size=${PAGE_SIZE}`
       ),
     ]);
     const summaryData = await summaryResponse.json();
     const historyData = await historyResponse.json();
     if (summaryResponse.ok) setAccount(summaryData);
-    if (historyResponse.ok) setHistory(historyData.items || []);
+    if (historyResponse.ok) {
+      setHistory(historyData.items || []);
+      setHistoryTotal(typeof historyData.total === "number" ? historyData.total : 0);
+      setHistoryTotalPages(typeof historyData.total_pages === "number" ? historyData.total_pages : 1);
+    }
+    if (historyPage !== 1) {
+      setHistoryPage(1);
+    }
   };
 
   const hashText = async (text) => {
@@ -176,6 +196,18 @@ export default function DashboardPage() {
         return;
       }
 
+      if (
+        initData.sourceCurrency &&
+        initData.targetCurrency &&
+        initData.amountCreditedInTargetCurrency
+      ) {
+        setTransferMessage(
+          `Handshake OK. Se debitaran ${initData.amountDebitedInSourceCurrency} ${initData.sourceCurrency} ` +
+            `(destino recibe ${initData.amountCreditedInTargetCurrency} ${initData.targetCurrency}; ` +
+            `TC 1 USD = ${initData.fxRateUsdCop} COP). Ejecutando...`
+        );
+      }
+
       const finalSignature = await signPayload(
         [initData.handshakeId, initData.challengeNonce, "EXECUTE"],
         passwordDigest
@@ -227,6 +259,11 @@ export default function DashboardPage() {
 
         <article className="panel panel-transfer">
           <h2>Transferir</h2>
+          <p className="muted">
+            El monto se debita en la moneda de tu cuenta ({account?.currencyCode || "..."}). Si el
+            destino es otra moneda, el banco acredita el equivalente (1 USD = 4000 COP por defecto,
+            configurable con USD_COP_RATE en el backend).
+          </p>
           <form className="form-grid" onSubmit={onTransferSubmit}>
             <input
               value={targetAccount}
@@ -266,28 +303,95 @@ export default function DashboardPage() {
         <article className="panel panel-history">
           <div className="history-header">
             <h2>Historial de transacciones</h2>
-            <select value={rangeType} onChange={(event) => setRangeType(event.target.value)}>
-              {FILTER_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
+            <div className="history-header-actions">
+              <Link href="/insights" className="btn btn-primary">
+                Ver resumen por categorias
+              </Link>
+              <select
+                value={rangeType}
+                onChange={(event) => {
+                  setRangeType(event.target.value);
+                  setHistoryPage(1);
+                }}
+              >
+                {FILTER_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
 
-          {history.length === 0 ? (
+          {historyTotal === null ? (
+            <p className="muted">Cargando historial...</p>
+          ) : historyTotal === 0 ? (
             <p className="muted">No hay transacciones para este filtro.</p>
           ) : (
-            <div className="history-list">
-              {history.map((item) => (
-                <div key={`${item.date}-${item.targetAccount}-${item.amount}`} className="history-item">
-                  <span>{new Date(item.date).toLocaleDateString("es-CO")}</span>
-                  <span>Cuenta destino: {item.targetAccount}</span>
-                  <span>Descripcion: {item.description}</span>
-                  <strong>{item.amount}</strong>
+            <>
+              <div className="history-list">
+                {history.map((item, index) => {
+                  const flow = flowForTransactionType(item.transactionType);
+                  const flowLabel = flow === "in" ? "Ingreso" : flow === "out" ? "Egreso" : "—";
+                  const badge = categoryBadgeForItem(item);
+                  const rowFrom = (historyPage - 1) * PAGE_SIZE + index + 1;
+                  return (
+                    <div
+                      key={`${item.date}-${item.targetAccount}-${item.amount}-${historyPage}-${index}`}
+                      className="history-item"
+                    >
+                      <span className="history-row-num muted">#{rowFrom}</span>
+                      <span>{new Date(item.date).toLocaleDateString("es-CO")}</span>
+                      <span className="history-flow">
+                        {flowLabel}
+                        {badge ? (
+                          <span className="category-badge" title="Categoria inferida por palabras clave">
+                            {badge.label}
+                          </span>
+                        ) : null}
+                      </span>
+                      <span>Referencia: {item.targetAccount}</span>
+                      <span>Descripcion: {item.description}</span>
+                      <strong>
+                        {flow === "out" ? "-" : flow === "in" ? "+" : ""}
+                        {item.amount}
+                      </strong>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="history-pagination">
+                <p className="history-pagination-meta muted">
+                  Mostrando{" "}
+                  <strong>
+                    {historyTotal === 0 ? 0 : (historyPage - 1) * PAGE_SIZE + 1}–
+                    {Math.min(historyPage * PAGE_SIZE, historyTotal)}
+                  </strong>{" "}
+                  de <strong>{historyTotal}</strong> ({PAGE_SIZE} por pagina)
+                </p>
+                <div className="history-pagination-actions">
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    disabled={historyPage <= 1}
+                    onClick={() => setHistoryPage((p) => Math.max(1, p - 1))}
+                  >
+                    Anterior
+                  </button>
+                  <span className="history-page-indicator">
+                    Pagina {historyPage} de {historyTotalPages}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    disabled={historyPage >= historyTotalPages}
+                    onClick={() => setHistoryPage((p) => p + 1)}
+                  >
+                    Siguiente
+                  </button>
                 </div>
-              ))}
-            </div>
+              </div>
+            </>
           )}
         </article>
       </section>

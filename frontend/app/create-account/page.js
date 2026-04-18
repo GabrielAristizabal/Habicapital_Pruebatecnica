@@ -74,13 +74,10 @@ export default function CreateAccountPage() {
             <option value="SAVINGS">SAVINGS</option>
             <option value="CHECKING">CHECKING</option>
           </select>
-          <input
-            name="currency_code"
-            placeholder="Moneda (USD)"
-            onChange={onChange}
-            value={form.currency_code}
-            required
-          />
+          <select name="currency_code" onChange={onChange} value={form.currency_code}>
+            <option value="USD">USD</option>
+            <option value="COP">COP</option>
+          </select>
           <input
             name="password"
             type="password"
